@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>MJ Dodge — Avoid the Basketballs</title>
+<style>
+  :root{
+    --bg:#e9ecef;
+    --ground:#2b2b2b;
+    --card:#ffffff;
+    --muted:#6b7280;
+  }
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;color:#111;}
+  body{display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#f7f9fb,var(--bg));}
+  .wrap{width:min(900px,95vw);max-width:900px;background:var(--card);border-radius:12px;box-shadow:0 10px 30px rgba(16,24,40,.08);padding:18px;}
+  header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;}
+  h1{font-size:18px;margin:0;}
+  .controls{font-size:13px;color:var(--muted);}
+  #gameCanvas{width:100%;height:360px;background:linear-gradient(180deg,#87CEEB 0%, #b0e0e6 60%, #f0f4f8 100%);border-radius:8px;display:block;cursor:default;}
+  .hud{display:flex;justify-content:space-between;align-items:center;margin-top:10px;}
+  .score{font-weight:700;font-family:monospace;}
+  .small{font-size:13px;color:var(--muted)}
+  .btn{background:#111;color:#fff;padding:8px 12px;border-radius:6px;border:0;cursor:pointer}
+  .footer{margin-top:12px;color:var(--muted);font-size:13px}
+  @media (max-width:420px){
+    #gameCanvas{height:260px}
+    h1{font-size:16px}
+  }
+</style>
+</head>
+<body>
+  <div class="wrap" role="application" aria-label="MJ Dodge game">
+    <header>
+      <h1>MJ Dodge</h1>
+      <div class="controls">Jump: <strong>Space / ↑ / Tap</strong> · Restart: <strong>R</strong></div>
+    </header>
+ 
+    <canvas id="gameCanvas" width="900" height="360"></canvas>
+ 
+    <div class="hud">
+      <div class="score">Score: <span id="score">0</span></div>
+      <div>
+        <button class="btn" id="pauseBtn">Pause</button>
+        <button class="btn" id="muteBtn">Mute</button>
+      </div>
+    </div>
+ 
+    <div class="footer">
+      Avoid the basketballs! Speed increases over time. Styling is a simple silhouette/jersey representation.
+    </div>
+  </div>
+ 
+<script>
+/*
+  MJ Dodge
+  - Single-file canvas game
+  - Jump to avoid basketball obstacles
+  - Score grows over time; speed ramps up
+  - Controls: Space/Up/Tap to jump, R to restart, P to pause/resume, M to mute
+*/
+ 
+/* ======= Setup ======= */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+ 
+let W = canvas.width;
+let H = canvas.height;
+function resizeCanvasToDisplaySize(){
+  // Keep internal resolution stable to avoid pixelation, but scale CSS size
+  const rect = canvas.getBoundingClientRect();
+  const ratio = Math.max(1, window.devicePixelRatio || 1);
+  const w = Math.floor(rect.width * ratio);
+  const h = Math.floor(rect.height * ratio);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    W = canvas.width;
+    H = canvas.height;
+  }
+}
+resizeCanvasToDisplaySize();
+window.addEventListener('resize', () => { resizeCanvasToDisplaySize(); });
+ 
+/* ======= Game state ======= */
+let running = true;
+let paused = false;
+let muted = false;
+ 
+let score = 0;
+const scoreEl = document.getElementById('score');
+ 
+let gameSpeed = 6;        // base horizontal speed for obstacles
+let gravity = 0.9;
+let spawnTimer = 0;
+let spawnInterval = 90;   // frames between spawns (decreases over time)
+let frameCount = 0;
+ 
+/* ======= Player ======= */
+const player = {
+  x: 80,
+  baseY: null,
+  y: 0,
+  w: 40,
+  h: 56,
+  vy: 0,
+  jumping: false,
+  jumpStrength: -17,
+  crouch: false
+};
+ 
+/* ======= Obstacles (basketballs) ======= */
+const obstacles = [];
+ 
+/* ======= Sounds (simple beeps) ======= */
+function beep(freq = 440, duration = 0.06, type = 'sine'){
+  if (muted) return;
+  try {
+    const ctxa = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctxa.createOscillator();
+    const g = ctxa.createGain();
+    o.type = type;
+    o.frequency.value = freq;
+    o.connect(g);
+    g.connect(ctxa.destination);
+    g.gain.value = 0.05;
+    o.start();
+    o.stop(ctxa.currentTime + duration);
+    o.onended = ()=> ctxa.close();
+  } catch(e){ /* ignore */ }
+}
+ 
+/* ======= Helper: draw basketball ======= */
+function drawBasketball(c, x, y, r){
+  // orange circle with seam lines
+  c.beginPath();
+  c.fillStyle = '#e07a1a';
+  c.arc(x, y, r, 0, Math.PI*2);
+  c.fill();
+  c.lineWidth = Math.max(1, r*0.12);
+  c.strokeStyle = '#612f00';
+  // seam vertical
+  c.beginPath();
+  c.arc(x, y, r*0.98, Math.PI/2, Math.PI*3/2);
+  c.stroke();
+  // horizontal-ish seam
+  c.beginPath();
+  c.ellipse(x, y, r*0.98, r*0.5, Math.PI/6, 0, Math.PI*2);
+  c.stroke();
+}
+ 
+/* ======= Player drawing (stylized silhouette + jersey 23) ======= */
+function drawPlayer(c, p){
+  // coords scaled for canvas resolution
+  const scale = Math.min(W/900, H/360);
+  const px = p.x;
+  const py = p.y;
+  // draw shadow
+  c.beginPath();
+  const shadowY = p.baseY + p.h + 6;
+  c.ellipse(px + p.w/2, shadowY, p.w*0.7, p.w*0.22, 0, 0, Math.PI*2);
+  c.fillStyle = 'rgba(0,0,0,0.12)';
+  c.fill();
+ 
+  // body: jersey rectangle
+  c.fillStyle = '#0b2f6b'; // deep blue jersey
+  c.fillRect(px, py + 10, p.w, p.h - 10);
+ 
+  // arm (left)
+  c.fillStyle = '#0b2f6b';
+  c.fillRect(px - 8, py + 18, 12, 8);
+ 
+  // arm (right)
+  c.fillRect(px + p.w - 4, py + 18, 12, 8);
+ 
+  // head
+  c.beginPath();
+  c.fillStyle = '#1f2937';
+  c.arc(px + p.w/2, py - 6, 12, 0, Math.PI*2);
+  c.fill();
+ 
+  // legs
+  c.fillStyle = '#111';
+  c.fillRect(px + 6, py + p.h - 2, 10, 16);
+  c.fillRect(px + p.w - 16, py + p.h - 2, 10, 16);
+ 
+  // jersey number "23" — simple, contrasting
+  c.font = `${12}px monospace`;
+  c.fillStyle = '#fff';
+  c.textAlign = 'center';
+  c.fillText('23', px + p.w/2, py + 30);
+}
+ 
+/* ======= Obstacle factory ======= */
+function spawnObstacle(){
+  // vary size and vertical position slightly
+  const r = Math.random()*10 + 12; // radius
+  // Ball travels along ground (with small arc occasionally)
+  const y = player.baseY + player.h/2 - r/2 + (Math.random() < 0.12 ? -40 : 0);
+  const x = W + r + 10;
+  const vx = -(gameSpeed + Math.random()*2);
+  obstacles.push({x,y,r,vx,passed:false, wobble: Math.random()*0.03});
+}
+ 
+/* ======= Collision detection ======= */
+function rectCircleColliding(px,py,pw,ph,cx,cy,cr){
+  // return true if rect(px,py,pw,ph) collides circle(cx,cy,cr)
+  const distX = Math.abs(cx - (px + pw/2));
+  const distY = Math.abs(cy - (py + ph/2));
+  if (distX > (pw/2 + cr)) return false;
+  if (distY > (ph/2 + cr)) return false;
+  if (distX <= (pw/2)) return true;
+  if (distY <= (ph/2)) return true;
+  const dx = distX - pw/2;
+  const dy = distY - ph/2;
+  return (dx*dx + dy*dy <= cr*cr);
+}
+ 
+/* ======= Reset game ======= */
+function resetGame(){
+  score = 0;
+  frameCount = 0;
+  obstacles.length = 0;
+  gameSpeed = 6;
+  spawnInterval = 90;
+  player.y = player.baseY = Math.floor(H*0.62) - player.h;
+  player.vy = 0;
+  running = true;
+  paused = false;
+  beep(880,0.04);
+}
+ 
+/* ======= Game over ======= */
+let gameOver = false;
+function endGame(){
+  if (!gameOver) beep(120,0.25,'sine');
+  gameOver = true;
+  running = false;
+}
+ 
+/* ======= Main update/draw loop ======= */
+function update(){
+  if (!running || paused) return;
+  frameCount++;
+  // increase difficulty slowly
+  if (frameCount % 300 === 0) {
+    gameSpeed += 0.5;
+    if (spawnInterval > 48) spawnInterval -= 4;
+  }
+ 
+  // spawn obstacles
+  spawnTimer++;
+  if (spawnTimer >= spawnInterval){
+    spawnObstacle();
+    spawnTimer = 0;
+  }
+ 
+  // update player physics
+  player.vy += gravity;
+  player.y += player.vy;
+  if (player.y > player.baseY){
+    player.y = player.baseY;
+    player.vy = 0;
+    player.jumping = false;
+  }
+ 
+  // update obstacles
+  for (let i = obstacles.length - 1; i >= 0; i--){
+    const o = obstacles[i];
+    // simple wobble for spinning look
+    o.x += o.vx;
+    o.y += Math.sin((frameCount + i*7) * 0.06) * o.wobble * 60;
+ 
+    // mark passed obstacles to increment score once
+    if (!o.passed && o.x + o.r < player.x){
+      o.passed = true;
+      score += 10;
+      beep(900 + Math.min(800, score/5), 0.03, 'sawtooth');
+    }
+ 
+    // remove offscreen
+    if (o.x + o.r < -50) obstacles.splice(i,1);
+  }
+ 
+  // collision check
+  for (const o of obstacles){
+    if (rectCircleColliding(player.x, player.y, player.w, player.h, o.x, o.y, o.r)){
+      endGame();
+      break;
+    }
+  }
+ 
+  // score increases with time (frames)
+  score += 0.1;
+  scoreEl.textContent = Math.floor(score);
+ 
+}
+ 
+/* ======= Draw everything ======= */
+function draw(){
+  // clear
+  ctx.clearRect(0,0,W,H);
+ 
+  // sky (already CSS background but we redraw gradient in canvas)
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, '#87CEEB');
+  g.addColorStop(0.6, '#b0e0e6');
+  g.addColorStop(1, '#f0f4f8');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+ 
+  // ground
+  const groundY = Math.floor(H*0.72);
+  ctx.fillStyle = '#2b2b2b';
+  ctx.fillRect(0, groundY, W, H - groundY);
+ 
+  // draw horizon/road line
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, groundY);
+  ctx.lineTo(W, groundY);
+  ctx.stroke();
+ 
+  // draw obstacles
+  for (const o of obstacles){
+    drawBasketball(ctx, o.x, o.y, o.r);
+  }
+ 
+  // draw player
+  drawPlayer(ctx, player);
+ 
+  // draw "YOU ARE THE BIG 12 CHAMP!" — not needed here, but we can show GAME OVER text
+  if (gameOver){
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.font = `${Math.max(20, Math.floor(W*0.04))}px sans-serif`;
+    ctx.fillText('GAME OVER', W/2, H/2 - 10);
+    ctx.font = `${Math.max(14, Math.floor(W*0.02))}px sans-serif`;
+    ctx.fillText(`Score: ${Math.floor(score)}`, W/2, H/2 + 26);
+    ctx.font = `${Math.max(13, Math.floor(W*0.015))}px monospace`;
+    ctx.fillText('Press R or Tap to restart', W/2, H/2 + 56);
+  }
+}
+ 
+/* ======= Game loop (rAF) ======= */
+function loop(){
+  resizeCanvasToDisplaySize();
+  if (!paused && running){
+    update();
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+ 
+/* ======= Input ======= */
+function jump(){
+  if (gameOver){
+    resetGame();
+    gameOver = false;
+    return;
+  }
+  if (!player.jumping){
+    player.vy = player.jumpStrength;
+    player.jumping = true;
+    beep(1100, 0.05, 'triangle');
+  }
+}
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'ArrowUp') {
+    e.preventDefault();
+    jump();
+  }
+  if (e.key === 'r' || e.key === 'R'){
+    resetGame(); gameOver = false;
+  }
+  if (e.key === 'p' || e.key === 'P'){
+    paused = !paused;
+    document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+  }
+  if (e.key === 'm' || e.key === 'M'){
+    muted = !muted;
+    document.getElementById('muteBtn').textContent = muted ? 'Unmute' : 'Mute';
+  }
+});
+canvas.addEventListener('click', (e) => {
+  if (gameOver) {
+    resetGame(); gameOver = false;
+  } else {
+    jump();
+  }
+});
+// mobile touch
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  if (gameOver) { resetGame(); gameOver = false; }
+  else jump();
+}, {passive:false});
+ 
+/* ======= UI Buttons ======= */
+document.getElementById('pauseBtn').addEventListener('click', ()=>{
+  paused = !paused;
+  document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+});
+document.getElementById('muteBtn').addEventListener('click', ()=>{
+  muted = !muted;
+  document.getElementById('muteBtn').textContent = muted ? 'Unmute' : 'Mute';
+});
+ 
+/* ======= Initialize sizes & start ======= */
+player.baseY = Math.floor(H*0.62) - player.h;
+player.y = player.baseY;
+ 
+resetGame();
+loop();
+</script>
+</body>
+</html>
